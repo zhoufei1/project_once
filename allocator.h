@@ -2,9 +2,11 @@
 
 #include <iostream>
 #include <string>
+#include <windows.h>
 using namespace std;
 
 #include <stdarg.h>//打trace log函数
+
 
 
 /////////////////////////////////////////////////////////////////////
@@ -44,7 +46,7 @@ inline void __trace_bug(const char *Function,const char *FileName,int line,char 
 static inline void print_log()
 {
 	cerr<<"out of memory"<<endl;
-	exit(1);
+	abort();
 }
 
 //一级空间配置器
@@ -64,15 +66,19 @@ public:
 	//分配内存
 	static void* allocate(size_t n)
 	{
-		__TRACE_DEBUG("分配内存块对象：%d bit\n", n);
+		__TRACE_DEBUG("一级空间配置器分配内存块对象：%d bit\n", n);
 		void *result=(void*)malloc(n);
 		if(0 == result)
+		{
+			//调用内联函数直接抛出异常,模拟c++的实现方式
 			print_log();
+		}
 		return result;
 	}
 	//释放内存空间
-	static void dellocate(void *p,size_t)
+	static void dellocate(void *p,size_t n)
 	{
+		__TRACE_DEBUG("一级空间配置器释放内存块：%p\t%dbit\n",p,n);
 		free(p);
 		//防止野指针
 		p=NULL;
@@ -80,10 +86,12 @@ public:
 	//重新分配内存
 	static void* reallocate(void *p,size_t n)
 	{
-		__TRACE_DEBUG("重新分配内存块对象：%d bit\n", n);
+		__TRACE_DEBUG("一级空间配置器重新分配内存块对象：%d bit\n", n);
 		void *result=realloc(p,n);
 		if(0 == result)
+		{
 			print_log();
+		}
 		return result;
 	}
 };
@@ -129,6 +137,21 @@ private:
 	static void* ReFill(size_t n);
 	//配置一大块空间，可容纳大小为size的区块
 	static char* ChunkAlloc(size_t size,size_t &nobjs);
+private:
+	class lock
+	{
+		HANDLE m_mutex;
+	public:
+		 lock() 
+		 { 
+			 m_mutex=::CreateMutex(NULL,false,NULL);
+		 }
+         ~lock() 
+		 {
+			 ::ReleaseMutex(m_mutex);
+		 }
+    };
+    friend class lock;
 public:
 	//分配内存
 	static void* Allocate(size_t n);
@@ -155,23 +178,26 @@ DefaultAllocTemplate<Threads,inst>::FreeList[NFREELISTS]={0};
 template<bool Threads,int inst>
 void* DefaultAllocTemplate<Threads,inst>::Allocate(size_t n)
 {
-	__TRACE_DEBUG("分配内存块对象：%d bit\n", n);
 	//如果分配内存大于128字节，则调用一级空间配置器
 	if(n > (size_t)MAX_BYTES)
 		return malloc_alloc<0>::allocate(n);
-
+	__TRACE_DEBUG("二级空间配置器分配内存块对象：%d bit\n",ROUND_UP(n));
 	void *result=0;//需要返回的申请的内存
-	//先寻找字节所在的位置
+
+	//先寻找字节所在位置的下标
 	size_t index=FREELIST_INDEX(n);
 
-	if(FreeList[index]==0)//自由链表中还没有内存时
+	lock lock_instance;
+	//表示自由链表中还没有内存，此时往自由链表中添加内存，即初始化内存池
+	if(FreeList[index]==0)
 		result=ReFill(ROUND_UP(n));
 	else
 	{
 		//取出链表的头返回
 		result=FreeList[index];
 		//将链表的头指向链表的下一个节点
-		FreeList[index]=((obj*)result)->FreeListLink;
+		//FreeList[index]=((obj*)result)->FreeListLink;
+		FreeList[index]=(FreeList[index])->FreeListLink;
 	}
 	return result;
 }
@@ -179,14 +205,18 @@ void* DefaultAllocTemplate<Threads,inst>::Allocate(size_t n)
 template<bool Threads,int inst>
 void DefaultAllocTemplate<Threads,inst>::DeAllocate(void *p,size_t n)
 {
-	__TRACE_DEBUG("释放内存块：%p  %d bit\n",p,n);
 	//如果大于128，让一级空间配置器回收
 	if(n > (size_t)MAX_BYTES)
 		malloc_alloc<0>::dellocate(p,n);
 	else
 	{
+		__TRACE_DEBUG("二级空间配置器还给内存池：%dbit\n",ROUND_UP(n));
 		//让不用的内存块连到自由链表中去
+		//首先找到需要插入的位置
 		size_t index=FREELIST_INDEX(n);
+		//加锁
+		lock lock_instance;
+		//让找到位置的指针链接到p的next上，再让p指向找到位置的地址上
 		((obj*)p)->FreeListLink=FreeList[index];
 		FreeList[index]=(obj*)p;
 	}
@@ -196,13 +226,13 @@ void DefaultAllocTemplate<Threads,inst>::DeAllocate(void *p,size_t n)
 template<bool Threads,int inst>
 void* DefaultAllocTemplate<Threads,inst>::ReAllocate(void *p,size_t old_size,size_t new_size)
 {
-	__TRACE_DEBUG("重新分配内存块对象：%d bit\n", n);
 	//如果需要增加的内存比之前的内存大并且大于128时调用一级空间配置器
 	if(old_size > (size_t)MAX_BYTES && new_size > (size_t)MAX_BYTES)
 		return malloc_alloc<0>::reallocate(p,new_size);
 	//如果上调后两个字节大小相等，则直接返回，出现这种情况的原因是按8的倍数对其
 	if(ROUND_UP(old_size) == ROUND_UP(new_size))
 		return p;
+	__TRACE_DEBUG("二级空间配置器重新分配内存块对象：%d bit\n", ROUND_UP(n));
 	void *result=0;
 	size_t copy_size=0;
 	//先申请空间大小
@@ -215,6 +245,8 @@ void* DefaultAllocTemplate<Threads,inst>::ReAllocate(void *p,size_t old_size,siz
 	return result;
 }
 
+
+//这个函数才是最最核心的函数，承担了创建内存池的作用
 template<bool Threads,int inst>
 char* DefaultAllocTemplate<Threads,inst>::ChunkAlloc(size_t size, size_t &nobjs)
 {
@@ -247,6 +279,7 @@ char* DefaultAllocTemplate<Threads,inst>::ChunkAlloc(size_t size, size_t &nobjs)
 			size_t index=FREELIST_INDEX(bytes_left);
 			((obj*)StartFree)->FreeListLink=FreeList[index];
 			FreeList[index]=(obj*)StartFree;
+			EndFree=StartFree+bytes_left;
 		}
 		//开辟一块新的内存块
 		StartFree=(char*)malloc(bytes_to_get);
@@ -260,6 +293,7 @@ char* DefaultAllocTemplate<Threads,inst>::ChunkAlloc(size_t size, size_t &nobjs)
 				if(FreeList[index])
 				{
 					//表示找到了，然后改变自由链表的头和尾，然后递归的去分配内存
+					//这是从一个大的内存中切一块出来使用
 					obj *start=FreeList[index];
 					StartFree=(char*)start;
 					FreeList[index]=start->FreeListLink;
@@ -284,21 +318,23 @@ void* DefaultAllocTemplate<Threads,inst>::ReFill(size_t n)
 {
 	size_t nobjs=20;//这是SGI里系统设定的初始值
 	char *chunk=ChunkAlloc(n,nobjs);//首先寻找内存块
-	__TRACE_DEBUG("找到内存池分配：n: %d bit  nobjs : %d \n", n,nobjs);
+	__TRACE_DEBUG("二级空间配置器找到内存池分配：n: %d bit  nobjs : %d \n", n,nobjs);
 	if(1==nobjs)
 		return chunk;
+	obj *cur=(obj*)(chunk+n);
 	//寻找字节在数组中的下标
 	size_t index=FREELIST_INDEX(n);
-	obj *cur=(obj*)(chunk+n);
 	FreeList[index]=cur;
 	//将从系统里申请到的内存块链接到自由链表中
 	for(size_t i=2; i<nobjs; ++i)
 	{
+		//这用的尾插的方式，这样可以保证他们的地址有序
 		obj *next=(obj*)(chunk+n*i);
 		cur->FreeListLink=next;
 		cur=next;
 	}
 	//自由链表的最后赋为0
 	cur->FreeListLink=0;
+	//返回的是第一块内存，从第二块后的内存链接到自由链表中
 	return chunk;
 }

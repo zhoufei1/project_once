@@ -31,7 +31,7 @@ public:
 	}
 	static void MallocDeAllocate(T *p,size_t n)
 	{
-		DefaultAlloc::DeAllocate(p,n*sizeof(T));
+		DefaultAlloc::DeAllocate(p,n);
 		//Malloc_alloc::dellocate(p,n*sizeof(T));
 	}
 };
